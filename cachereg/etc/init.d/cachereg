@@ -1,0 +1,81 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          cachereg
+# Required-Start:    $all
+# Required-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: NICOS cache registrant
+### END INIT INFO
+
+# Author: Alexander Lenz <alexander.lenz@frm2.tum.de>
+
+if test -r /lib/lsb/init-functions ; then
+	. /lib/lsb/init-functions
+fi
+
+. /etc/tacoenv.sh
+. /etc/default/cachereg
+
+BINARY_SHORT=cachereg
+BINARY_FULL=$(which $BINARY_SHORT)
+if [ ! -x "${BINARY_FULL}" ] ;
+then
+	log_progress_msg "Cannot find ${BINARY_SHORT}; Abort!\n"
+	exit 127
+fi
+
+PID=/var/run/$BINARY_SHORT.pid
+
+do_start()
+{
+	export NETHOST
+
+	PARAMS=" -i ${INTERFACE} -d"
+
+	if [ -n "${ADDITIONAL_CACHE}" ]; then
+		PARAMS="${PARAMS} -a ${ADDITIONAL_CACHE}"
+	fi
+
+	start-stop-daemon --start --pidfile $PID --exec $BINARY_FULL -- $PARAMS
+	return $?
+}
+
+do_stop()
+{
+	start-stop-daemon --stop --pidfile $PID
+	return $?
+}
+
+do_status()
+{
+	status_of_proc -p $PID $BINARY_FULL $BINARY_SHORT
+	return $?
+}
+
+
+
+case "$1" in
+  start|"")
+        do_start
+        exit $?
+        ;;
+  restart|reload|force-reload)
+	do_stop
+	do_start
+        exit $?
+        ;;
+  stop)
+	do_stop
+        exit $?
+        ;;
+  status)
+        do_status
+        exit $?
+        ;;
+  *)
+        echo "Usage: ${0} [start|stop|status]" >&2
+        exit 3
+        ;;
+esac
+

@@ -1,0 +1,296 @@
+#!/usr/bin/env python
+#  -*- coding: utf-8 -*-
+# *****************************************************************************
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation; either version 2 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program; if not, write to the Free Software Foundation, Inc.,
+# 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+# Module authors:
+#   Alexander Lenz <alexander.lenz@frm2.tum.de>
+#
+# *****************************************************************************
+
+import os
+import sys
+import socket
+import argparse
+import time
+import select
+import pwd
+import grp
+
+import daemon
+try:
+    import daemon.pidlockfile as pidlockfile
+except ImportError:
+    import daemon.pidfile as pidlockfile
+
+import netifaces
+import mlzlog
+
+CACHE_PORT = 14869
+READ_BUF_SIZE = 10240
+
+
+class Cachereg(object):
+    def __init__(self, iface, additionalCache, networkTimeout, ttl,
+                 identifier, setupName, checkFile, log):
+        self.log = log
+
+        self._additionalCache = additionalCache
+        self._networkTimeout = networkTimeout
+        self._ttl = ttl
+        self._identifier = identifier
+        self._setupName = setupName
+        self._checkFile = checkFile
+        self._broadcastAddr = self._getBroadcastAddr(iface)
+        self._registrationMsg = self._getRegistrationMsg()
+
+        self._udpSocket = None
+        self._tcpSocket = None
+
+    def run(self):
+        try:
+            self._openSockets()
+        except RuntimeError as e:
+            self.log.exception(e)
+
+        self.log.info('Start registration loop ...')
+        while True:
+            start = time.time()
+            if self._checkFile:
+                if not os.path.exists(self._checkFile):
+                    self.log.info('File %s not present anymore, exiting',
+                                  self._checkFile)
+                    return
+            try:
+                self._broadcastRegistration()
+
+                if self._tcpSocket:
+                    self._unicastRegistration()
+            except Exception as e:
+                self.log.exception(e)
+                try:
+                    self._openSockets()
+                except RuntimeError as e:
+                    self.log.debug('Exception occured during reconnect: %s', e)
+
+            # sleep some time and wake up early enough to send the next
+            # registration
+            sleepTime = self._ttl - 5 * (time.time() - start)
+            self.log.debug('sleep for %f s', sleepTime)
+            time.sleep(sleepTime)
+
+    def _broadcastRegistration(self):
+        self.log.debug('Broadcast registration ...')
+
+        reply = self._broadcast(self._registrationMsg)
+        if reply:
+            for entry in reply:
+                self.log.debug('Registered to cache at: %s', entry[0])
+
+    def _unicastRegistration(self):
+        self.log.debug('Unicast registration to %s ...', self._additionalCache)
+
+        reply = self._unicast(self._registrationMsg)
+        if reply:
+            for _entry in reply:
+                self.log.debug('Registered to cache at: %s',
+                               self._additionalCache)
+
+    def _broadcast(self, msg, awaitresponse=True):
+
+        self.log.debug('Send broadcast %r, using broadcast address %s',
+                       msg, self._broadcastAddr)
+
+        self._udpSocket.sendto(msg, (self._broadcastAddr, CACHE_PORT))
+
+        if awaitresponse:
+            return self._getReply(self._udpSocket)
+
+    def _unicast(self, msg, awaitresponse=True):
+        if self._tcpSocket:
+            self.log.debug('Send unicast ...')
+
+            self._tcpSocket.send(msg)
+
+            if awaitresponse:
+                return self._getReply(self._tcpSocket)
+
+    def _getReply(self, sock):
+        result = []
+
+        while True:
+            try:
+                readReady, _, _ = select.select([sock], [], [],
+                                                self._networkTimeout)
+
+                if not readReady:
+                    break
+                reply, source = sock.recvfrom(READ_BUF_SIZE)
+
+                if source:
+                    source = '%s:%s' % (source[0], source[1])
+
+                result.append((source, reply))
+            except select.error as e:
+                self.log.exception(e)
+                raise RuntimeError(str(e))
+        return result
+
+    def _openSockets(self):
+        try:
+            self._openUDPSocket()
+
+            if self._additionalCache:
+                self._openTCPSocket()
+        except socket.error as e:
+            raise RuntimeError(e)
+
+    def _openUDPSocket(self):
+        if self._udpSocket:
+            self._udpSocket.close()
+
+        self.log.debug('Open UDP socket ...')
+        self._udpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM,
+                                        socket.IPPROTO_UDP)
+        self._udpSocket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST,
+                                   True)
+        self._udpSocket.settimeout(self._networkTimeout)
+
+    def _openTCPSocket(self):
+        if self._tcpSocket:
+            self._tcpSocket.close()
+
+        self.log.debug('Open TCP socket to %s:%s ...',
+                       self._additionalCache, CACHE_PORT)
+        self._tcpSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM,
+                                        socket.IPPROTO_TCP)
+        self._tcpSocket.settimeout(self._networkTimeout)
+
+        self._tcpSocket.connect((self._additionalCache, CACHE_PORT))
+
+    def _getBroadcastAddr(self, ifname='eth0'):
+        self.log.debug('Use interface: %s', ifname)
+        ifaddrs = netifaces.ifaddresses(ifname)[netifaces.AF_INET][0]
+        return ifaddrs['broadcast']
+
+    def _getRegistrationMsg(self):
+        fqdn = socket.getfqdn()
+        if self._identifier:
+            identifier = self._identifier
+        else:
+            identifier = fqdn
+        if self._setupName:
+            setupName = self._setupName
+        else:
+            setupName = fqdn.split('.', 1)[0]
+        cachePrefix = '+%d@se/%s/nicos' % (self._ttl, identifier)
+
+        setMsg = '%s/setupname=\'%s\'' % (cachePrefix, setupName)
+        queryMsg = '%s/setupname?' % cachePrefix
+
+        return '%s\n%s\n' % (setMsg, queryMsg)
+
+
+def parseArgv(argv):
+    '''
+    Parse command line arguments.
+    '''
+    parser = argparse.ArgumentParser(
+        description='NICOS cache registration '
+        'tool',
+        conflict_handler='resolve')
+
+    parser.add_argument('-v', '--verbose', action='store_true', default=False,
+                        help='Verbose logging')
+    parser.add_argument('-i', '--interface', default='eth0',
+                        help='Network interface to use')
+    parser.add_argument('-a', '--additional-cache',
+                        help='Additional cache to register to')
+    parser.add_argument('-t', '--network-timeout', type=float, default=2.0,
+                        help='Network timeout for registration answers')
+    parser.add_argument('-l', '--ttl', type=float, default=60.0,
+                        help='Time to live for the cache registration')
+    parser.add_argument('-w', '--working-directory', default='/tmp',
+                        help='Working directory for daemon')
+    parser.add_argument('-u', '--user', default='root',
+                        help='User for daemon')
+    parser.add_argument('-g', '--group', default='root',
+                        help='Group for daemon')
+    parser.add_argument('-d', '--daemonize', action='store_true', default=False,
+                        help='Run as daemon')
+    parser.add_argument('-p', '--pid-file', default='/var/run/cachereg.pid',
+                        help='Used pid file')
+    parser.add_argument('-L', '--log-dir', default='/var/log',
+                        help='Used directory for logfiles')
+    parser.add_argument('-F', '--check-file', default='',
+                        help='If given, exit when this file does not exist')
+    parser.add_argument('-I', '--identifier', default='',
+                        help='Explicit PNP identifier to register')
+    parser.add_argument('-S', '--setupname', default='',
+                        help='Explicit NICOS setup name to register')
+
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv
+
+    args = parseArgv(argv[1:])
+
+    loglevel = 'debug' if args.verbose else 'info'
+
+    mlzlog.initLogging('cachereg', loglevel, args.log_dir)
+
+    try:
+        reg = Cachereg(args.interface,
+                       args.additional_cache,
+                       args.network_timeout,
+                       args.ttl,
+                       args.identifier,
+                       args.setupname,
+                       args.check_file,
+                       mlzlog.log)
+    except Exception as e:
+        mlzlog.log.exception(e)
+        raise
+
+    if args.daemonize:
+        uid = pwd.getpwnam(args.user).pw_uid
+        gid = grp.getgrnam(args.group).gr_gid
+        if args.pid_file:
+            pidfile = pidlockfile.TimeoutPIDLockFile(args.pid_file, 3)
+        else:
+            pidfile = None
+
+        mlzlog.log.info('Daemonize as %s:%s ...' % (args.user, args.group))
+
+        # pylint: disable=bad-continuation
+        with daemon.DaemonContext(
+                files_preserve=mlzlog.log.getLogfileStreams(),
+                working_directory=args.working_directory,
+                pidfile=pidfile,
+                uid=uid,
+                gid=gid):
+            reg.run()
+    else:
+        reg.run()
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
