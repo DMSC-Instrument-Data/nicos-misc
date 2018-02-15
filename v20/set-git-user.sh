@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Make git to use a predefined user for this shell session only
+# Make git use predefined credentials for this shell session only
 # This script should be sourced in .bashrc or similar
 # Usage: set_git_user <username>
 
@@ -61,4 +61,3 @@ function set_git_user() {
 
     alias git="$git_cmd"
 }
-
