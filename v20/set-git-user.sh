@@ -57,6 +57,7 @@ function set_git_user() {
     git_cmd='git'
     git_cmd="$git_cmd -c user.name=\"$git_name\""
     git_cmd="$git_cmd -c user.email=\"$git_mail\""
+    git_cmd="$git_cmd -c url.ssh://$ssh_host:29418/.insteadOf=\"https://forge.frm2.tum.de/review/\""
     git_cmd="$git_cmd -c url.ssh://$ssh_host.insteadOf=\"ssh://forge.frm2.tum.de\""
 
     alias git="$git_cmd"
